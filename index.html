@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sprite Stacking デモ</title>
+<style>
+  :root { --bg:#16141c; --panel:#221f2b; --text:#e8e4f0; --muted:#9a94a8; --accent:#ffb347; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family: system-ui, "Yu Gothic UI", sans-serif; font-size:14px; }
+  .wrap { display:flex; gap:16px; padding:16px; flex-wrap:wrap; align-items:flex-start; }
+  .game { flex: 1 1 640px; min-width: 0; }
+  #view { width:100%; image-rendering: pixelated; background:#000; display:block; border-radius:6px; }
+  .side { flex: 0 1 340px; display:flex; flex-direction:column; gap:12px; min-width:0; }
+  .card { background:var(--panel); border-radius:8px; padding:12px; }
+  .card h2 { font-size:13px; margin:0 0 8px; color:var(--accent); }
+  label { display:flex; align-items:center; gap:8px; margin:6px 0; }
+  label span.v { width:36px; text-align:right; color:var(--muted); font-variant-numeric: tabular-nums; }
+  input[type=range] { flex:1; }
+  kbd { background:#333044; border-radius:3px; padding:1px 5px; font-size:12px; }
+  .hint { color:var(--muted); line-height:1.7; }
+  #viewer { width:192px; height:192px; image-rendering:pixelated; background:#2c2838; border-radius:6px; display:block; margin:0 auto; }
+  .sheetbox { overflow-x:auto; background:#2c2838; border-radius:6px; padding:6px; margin-top:8px; }
+  #sheetimg { image-rendering:pixelated; display:block; }
+  select, button { background:#333044; color:var(--text); border:1px solid #4a4560; border-radius:5px; padding:5px 8px; font:inherit; }
+  button { cursor:pointer; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  code { color:var(--accent); font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="game">
+    <canvas id="view" width="320" height="200"></canvas>
+    <p class="hint">
+      <kbd>W</kbd><kbd>S</kbd>/<kbd>↑</kbd><kbd>↓</kbd> 加速・後退
+      <kbd>A</kbd><kbd>D</kbd>/<kbd>←</kbd><kbd>→</kbd> ハンドル
+      <kbd>Q</kbd><kbd>E</kbd> カメラ回転（追従オフ時）
+    </p>
+  </div>
+  <div class="side">
+    <div class="card">
+      <h2>表示設定</h2>
+      <label>描画倍率
+        <select id="K">
+          <option value="1">1×（本来のドット・ちらつき大）</option>
+          <option value="2">2×</option>
+          <option value="3" selected>3×（おすすめ）</option>
+          <option value="4">4×</option>
+        </select>
+      </label>
+      <label>squash <input id="squash" type="range" min="0.4" max="1" step="0.05" value="0.7"><span class="v" id="squashV"></span></label>
+      <label>spacing <input id="spacing" type="range" min="0" max="2" step="0.25" value="1"><span class="v" id="spacingV"></span></label>
+      <label><input id="outline" type="checkbox" checked> 輪郭線（完成形に1回だけ）</label>
+      <label><input id="shadow" type="checkbox" checked> 影</label>
+      <label><input id="follow" type="checkbox" checked> カメラを車の向きに追従</label>
+    </div>
+    <div class="card">
+      <h2>モデル確認</h2>
+      <div class="row">
+        <select id="modelSel"></select>
+        <button id="savePng">スライスシートをPNG保存</button>
+      </div>
+      <canvas id="viewer" width="64" height="64"></canvas>
+      <div class="sheetbox"><canvas id="sheetimg"></canvas></div>
+      <p class="hint" id="info"></p>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+// =====================================================================
+// 決定的な乱数・ハッシュ（同じ入力なら必ず同じ値 → 毎回同じドット）
+// =====================================================================
+function ハッシュ(x, y, z, seed) {
+  let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(z, 1274126177) + Math.imul(seed, 2246822519)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+function 乱数列(seed) { // mulberry32
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const 色キャッシュ = {};
+function hex(c) {
+  if (!色キャッシュ[c])色キャッシュ[c] = [parseInt(c.slice(1,3),16), parseInt(c.slice(3,5),16), parseInt(c.slice(5,7),16)];
+  return 色キャッシュ[c];
+}
+
+// =====================================================================
+// ボクセル定義 → スライスシート生成
+//   fn(x, y, z) が色(#rrggbb)か null を返す。y=0 がモデルの「前」(画面上向き)
+// =====================================================================
+function モデル作成(名前, W, D, H, fn) {
+  const grid = new Array(W * D * H);
+  const idx = (x, y, z) => (z * D + y) * W + x;
+  for (let z = 0; z < H; z++) for (let y = 0; y < D; y++) for (let x = 0; x < W; x++) grid[idx(x,y,z)] = fn(x, y, z) || null;
+  const 埋まり = (x, y, z) => x >= 0 && y >= 0 && z >= 0 && x < W && y < D && z < H && grid[idx(x,y,z)] !== null;
+
+  const sheet = document.createElement('canvas'); sheet.width = W * H; sheet.height = D;
+  const sctx = sheet.getContext('2d'); const img = sctx.createImageData(W * H, D);
+  const sil = document.createElement('canvas'); sil.width = W; sil.height = D;
+  const lctx = sil.getContext('2d'); const simg = lctx.createImageData(W, D);
+
+  for (let z = 0; z < H; z++) for (let y = 0; y < D; y++) for (let x = 0; x < W; x++) {
+    const c = grid[idx(x,y,z)]; if (!c) continue;
+    const [r, g, b] = hex(c);
+    // 陰影：低い層ほど暗く（簡易AO）、上が空いている面は明るく
+    let f = 0.78 + 0.22 * (H > 1 ? z / (H - 1) : 1);
+    if (!埋まり(x, y, z + 1)) f *= 1.12;
+    const p = (y * W * H + z * W + x) * 4;
+    img.data[p] = Math.min(255, Math.round(r * f));
+    img.data[p+1] = Math.min(255, Math.round(g * f));
+    img.data[p+2] = Math.min(255, Math.round(b * f));
+    img.data[p+3] = 255;
+    const q = (y * W + x) * 4; simg.data[q+3] = 255;
+  }
+  sctx.putImageData(img, 0, 0);
+  lctx.putImageData(simg, 0, 0);
+
+  // シートのチェックサム（FNV-1a）：同じコードなら毎回同じ値になることの確認用
+  let h = 0x811c9dc5;
+  for (let i = 0; i < img.data.length; i++) { h ^= img.data[i]; h = Math.imul(h, 16777619); }
+  return { 名前, W, D, H, sheet, sil, checksum: (h >>> 0).toString(16).padStart(8, '0') };
+}
+
+// ---------------- 各モデル（すべてコードで定義） ----------------
+const モデル = {};
+
+モデル.車 = モデル作成('車', 14, 24, 9, (x, y, z) => {
+  const 車輪Y = (y >= 3 && y <= 7) || (y >= 16 && y <= 20);
+  // キャビン
+  if (z >= 6) {
+    if (z === 6 && y === 7 && x >= 3 && x <= 10) return '#4a6a8c';               // フロントガラス下端
+    if (x < 2 || x > 11 || y < 8 || y > 17) return null;
+    if (z === 8) return (x >= 6 && x <= 7) ? '#f2f2f2' : (x >= 3 && x <= 10 && y >= 9 && y <= 16 ? '#d8443a' : null);
+    if (x === 2 || x === 11 || y === 8 || y === 17) return '#4a6a8c';                  // 窓
+    return '#d8443a';
+  }
+  if ((x === 0 || x === 13) && 車輪Y && z <= 3) return '#222228';                    // タイヤ
+  if (z <= 1) return (車輪Y && x >= 1 && x <= 12) ? '#222228' : null;               // 車軸
+  if (x < 1 || x > 12 || y < 1 || y > 22) return null;
+  if ((x === 1 || x === 12) && (y === 1 || y === 22)) return null;                   // 角を丸める
+  if (y === 1 && (z === 3 || z === 4) && [2,3,10,11].includes(x)) return '#ffe9a0';  // ヘッドライト
+  if (y === 22 && (z === 3 || z === 4) && [2,3,10,11].includes(x)) return '#ff3030'; // テールランプ
+  if (z === 2) return '#8a2a26';                                                     // バンパー
+  if (z === 5 && x >= 6 && x <= 7) return '#f2f2f2';                                 // ストライプ
+  return '#d8443a';
+});
+
+モデル.木箱 = モデル作成('木箱', 10, 10, 10, (x, y, z) => {
+  const 端 = (x === 0 || x === 9) + (y === 0 || y === 9) + (z === 0 || z === 9);
+  if (端 >= 2) return '#7a4a22';
+  if (z === 9) return (x % 3 === 0) ? '#a87038' : '#c08a4a';
+  return (z % 3 === 0) ? '#a87038' : '#c08a4a';
+});
+
+モデル.樽 = モデル作成('樽', 10, 10, 11, (x, y, z) => {
+  const d = Math.hypot(x - 4.5, y - 4.5);
+  const r = 4.2 + 0.5 * Math.sin(Math.PI * z / 10);
+  if (d > r) return null;
+  if (z === 10) return d < 3 ? '#2e5a88' : '#3a6ea5';
+  if (z === 2 || z === 8) return '#2a3a4a';
+  return '#3a6ea5';
+});
+
+モデル.コーン = モデル作成('コーン', 9, 9, 10, (x, y, z) => {
+  if (z === 0) return '#c04a18';
+  const r = 3.8 * (1 - (z - 1) / 10);
+  if (Math.hypot(x - 4, y - 4) > r + 0.3) return null;
+  return (z === 4 || z === 5) ? '#f4f4f4' : '#ff7a28';
+});
+
+function 木を作る(seed) {
+  const rnd = 乱数列(seed);
+  const 球 = [[8, 8, 15, 6.5]];
+  for (let i = 0; i < 3; i++) 球.push([8 + rnd() * 6 - 3, 8 + rnd() * 6 - 3, 11 + rnd() * 8, 3.5 + rnd() * 2]);
+  return モデル作成('木' + seed, 17, 17, 23, (x, y, z) => {
+    for (const [cx, cy, cz, r] of 球) {
+      if (Math.hypot(x - cx, y - cy, (z - cz) * 1.1) <= r - ハッシュ(x, y, z, seed) * 1.4) {
+        const n = ハッシュ(x, y, z, seed + 7);
+        return n < 0.33 ? '#2f6e30' : n < 0.75 ? '#3f8a3a' : '#4fa24a';
+      }
+    }
+    if (x >= 7 && x <= 9 && y >= 7 && y <= 9 && z <= 12 && !(x !== 8 && y !== 8)) return '#6b4426';
+    return null;
+  });
+}
+モデル.木A = 木を作る(11);
+モデル.木B = 木を作る(23);
+モデル.木C = 木を作る(37);
+
+モデル.家 = モデル作成('家', 26, 22, 22, (x, y, z) => {
+  if (x >= 18 && x <= 20 && y >= 4 && y <= 6 && z >= 12) return z === 21 ? '#5a2a20' : '#8a3a2a'; // 煙突
+  if (z >= 12) {
+    const half = 11 - (z - 12) * (10.5 / 9);
+    const dy = Math.abs(y - 10.5);
+    if (dy > half) return null;
+    const 屋根 = dy > half - 1.5;
+    if (x === 0 || x === 25) return 屋根 ? '#9a3e30' : null;
+    return 屋根 ? (z % 2 ? '#b04a3a' : '#9a3e30') : '#e8dcc0';
+  }
+  if (x < 1 || x > 24 || y < 1 || y > 20) return null;
+  if (z === 0) return '#9a948a';
+  const 正面 = y === 20, 背面 = y === 1, 側面 = x === 1 || x === 24;
+  if (正面 && x >= 11 && x <= 14 && z <= 7) return z === 7 || x === 11 || x === 14 ? '#4a2e18' : '#6b4426';
+  const 窓枠 = (a, b, lo, hi) => a >= lo && a <= hi && b >= 5 && b <= 8;
+  if ((正面 || 背面) && (窓枠(x, z, 4, 7) || 窓枠(x, z, 18, 21))) return (x === 4 || x === 7 || x === 18 || x === 21 || z === 5 || z === 8) ? '#f4f0e6' : '#5a7aa0';
+  if (側面 && 窓枠(y, z, 8, 13)) return (y === 8 || y === 13 || z === 5 || z === 8) ? '#f4f0e6' : '#5a7aa0';
+  return '#e8dcc0';
+});
+
+// =====================================================================
+// 地面（これも決定的に生成）
+// =====================================================================
+const 世界 = 640, 中心 = 320, 道R = 198, 池 = [150, 140, 40];
+const 地面 = document.createElement('canvas'); 地面.width = 世界; 地面.height = 世界;
+(() => {
+  const g = 地面.getContext('2d'); const im = g.createImageData(世界, 世界);
+  const 草 = ['#4a8a3a', '#4f9440', '#468236'].map(hex);
+  for (let y = 0; y < 世界; y++) for (let x = 0; x < 世界; x++) {
+    let c;
+    const r = Math.hypot(x - 中心, y - 中心);
+    const pd = Math.hypot(x - 池[0], y - 池[1]);
+    const n = ハッシュ(x, y, 0, 99);
+    if (pd < 池[2]) c = hex(n < 0.04 ? '#5a90d0' : '#3a70b0');
+    else if (pd < 池[2] + 4) c = hex(n < 0.3 ? '#b8a060' : '#c8b070');
+    else if (Math.abs(r - 道R) <= 18) {
+      if (Math.abs(r - 道R) > 16.5) c = hex('#d8d8d0');
+      else if (Math.abs(r - 道R) < 1 && Math.floor(Math.atan2(y - 中心, x - 中心) * 道R / 8) % 2 === 0) c = hex('#e8c040');
+      else c = hex(n < 0.1 ? '#5a5a64' : '#50505a');
+    } else {
+      c = 草[Math.floor(ハッシュ(x >> 1, y >> 1, 1, 5) * 3)];
+      if (n > 0.996) c = hex(n > 0.998 ? '#e8d860' : '#f0f0f0');
+    }
+    const p = (y * 世界 + x) * 4;
+    im.data[p] = c[0]; im.data[p+1] = c[1]; im.data[p+2] = c[2]; im.data[p+3] = 255;
+  }
+  g.putImageData(im, 0, 0);
+})();
+
+// =====================================================================
+// 配置（固定シード）
+// =====================================================================
+const 物 = [];
+物.push({ m: モデル.家, x: 290, y: 300, a: 0 });
+物.push({ m: モデル.家, x: 372, y: 350, a: 0.45 });
+[[322, 262], [334, 264], [328, 252]].forEach(([x, y], i) => 物.push({ m: モデル.木箱, x, y, a: i * 0.3 }));
+[[250, 340], [260, 346], [244, 352]].forEach(([x, y], i) => 物.push({ m: モデル.樽, x, y, a: i }));
+for (let i = 0; i < 16; i++) {
+  const t = i / 16 * Math.PI * 2;
+  物.push({ m: モデル.コーン, x: 中心 + Math.cos(t) * (道R - 24), y: 中心 + Math.sin(t) * (道R - 24), a: t });
+}
+(() => {
+  const rnd = 乱数列(12345); const 木s = [モデル.木A, モデル.木B, モデル.木C]; const 置いた = [];
+  for (let i = 0; i < 400 && 置いた.length < 70; i++) {
+    const x = 20 + rnd() * (世界 - 40), y = 20 + rnd() * (世界 - 40), k = Math.floor(rnd() * 3), a = rnd() * 6.28;
+    if (Math.abs(Math.hypot(x - 中心, y - 中心) - 道R) < 34) continue;
+    if (Math.hypot(x - 池[0], y - 池[1]) < 池[2] + 12) continue;
+    if (Math.hypot(x - 330, y - 320) < 80) continue;
+    if (置いた.some(p => Math.hypot(p.x - x, p.y - y) < 16)) continue;
+    const o = { m: 木s[k], x, y, a }; 置いた.push(o); 物.push(o);
+  }
+})();
+const 車 = { m: モデル.車, x: 中心 + 道R + 8, y: 中心, a: 0, v: 0 };
+物.push(車);
+
+// =====================================================================
+// 描画
+// =====================================================================
+const view = document.getElementById('view'), ctx = view.getContext('2d');
+const VW = view.width, VH = view.height, CY = Math.round(VH * 0.58);
+// 作業用キャンバス（スタック本体と、輪郭合成用）
+const scratch = document.createElement('canvas'), sc = scratch.getContext('2d');
+const oc = document.createElement('canvas'), occ = oc.getContext('2d');
+const 設定 = { K: 3, squash: 0.7, spacing: 1, outline: true, shadow: true, follow: true };
+let cam = 0, camX = 車.x, camY = 車.y;
+
+// ちらつき対策の要：
+//   ドット1個を K×K の「ブロック」として、K倍の解像度で回転・潰しを計算する。
+//   1×だと回転のたびに「どの元ドットを拾うか」が1px単位で飛ぶのでチラつくが、
+//   K倍だとズレが 1/K に細かくなり、ドットが滑らかに回って見える。
+//   スライス間隔も K px 単位で持ち上げるので、ドットの粒の大きさは保たれる。
+function スタック描画(target, m, sx, sy, ang, K) {
+  const S = Math.ceil(Math.hypot(m.W, m.D));
+  const halfH = Math.ceil(S * 設定.squash / 2);
+  const w = (S + 4) * K;
+  const h = (Math.ceil((m.H - 1) * 設定.spacing) + 2 * halfH + 6) * K;
+  const bx = Math.round(w / 2), by = h - (halfH + 3) * K;
+  for (const c of [scratch, oc]) if (c.width < w || c.height < h) { c.width = Math.max(c.width, w); c.height = Math.max(c.height, h); }
+
+  sc.setTransform(1, 0, 0, 1, 0, 0);
+  sc.clearRect(0, 0, w, h);
+  sc.imageSmoothingEnabled = false;
+  for (let z = 0; z < m.H; z++) {
+    sc.setTransform(K, 0, 0, K * 設定.squash, bx, by - Math.round(z * 設定.spacing * K));
+    sc.rotate(ang);
+    sc.drawImage(m.sheet, z * m.W, 0, m.W, m.D, -m.W / 2, -m.D / 2, m.W, m.D);
+  }
+  let src = scratch;
+  if (設定.outline) {
+    // 輪郭：完成形を上下左右に K px ずらして重ね、暗色で塗ってから本体を上に乗せる（GPU合成なので軽い）
+    occ.setTransform(1, 0, 0, 1, 0, 0);
+    occ.globalCompositeOperation = 'source-over';
+    occ.clearRect(0, 0, w, h);
+    occ.imageSmoothingEnabled = false;
+    for (const [dx, dy] of [[K, 0], [-K, 0], [0, K], [0, -K]]) occ.drawImage(scratch, 0, 0, w, h, dx, dy, w, h);
+    occ.globalCompositeOperation = 'source-in';
+    occ.fillStyle = '#1a1420'; occ.fillRect(0, 0, w, h);
+    occ.globalCompositeOperation = 'source-over';
+    occ.drawImage(scratch, 0, 0, w, h, 0, 0, w, h);
+    src = oc;
+  }
+  target.drawImage(src, 0, 0, w, h, Math.round(sx) - bx, Math.round(sy) - by, w, h);
+}
+
+function 影描画(m, sx, sy, ang, K) {
+  ctx.setTransform(K, 0, 0, K * 設定.squash, Math.round(sx) + 2 * K, Math.round(sy) + K);
+  ctx.rotate(ang);
+  ctx.drawImage(m.sil, -m.W / 2, -m.D / 2);
+}
+
+function 描画() {
+  const K = 設定.K;
+  if (view.width !== VW * K) { view.width = VW * K; view.height = VH * K; }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = '#2a3a2a'; ctx.fillRect(0, 0, view.width, view.height);
+  // カメラ位置は 1/K px 単位に揃える（K倍画面の1px＝整数座標）
+  const cx = Math.round(camX * K) / K, cy = Math.round(camY * K) / K;
+  // 地面
+  ctx.setTransform(K, 0, 0, K * 設定.squash, VW * K / 2, CY * K);
+  ctx.rotate(-cam);
+  ctx.drawImage(地面, -cx, -cy);
+  // 画面座標へ変換（K倍画面のピクセル単位）
+  const c = Math.cos(-cam), s = Math.sin(-cam);
+  const 表示 = [];
+  for (const o of 物) {
+    const dx = o.x - cx, dy = o.y - cy;
+    const sx = (VW / 2 + dx * c - dy * s) * K, sy = (CY + (dx * s + dy * c) * 設定.squash) * K;
+    if (sx < -40 * K || sx > (VW + 40) * K || sy < -20 * K || sy > (VH + 60) * K) continue;
+    表示.push({ o, sx, sy, ang: o.a - cam });
+  }
+  表示.sort((p, q) => p.sy - q.sy); // 接地点のyで並べ替え（スタック単位）
+  if (設定.shadow) {
+    ctx.globalAlpha = 0.28;
+    for (const p of 表示) 影描画(p.o.m, p.sx, p.sy, p.ang, K);
+    ctx.globalAlpha = 1;
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  for (const p of 表示) スタック描画(ctx, p.o.m, p.sx, p.sy, p.ang, K);
+  ctx.fillStyle = '#ffffffcc'; ctx.font = (8 * K) + 'px monospace';
+  ctx.fillText(Math.round(Math.abs(車.v)) + ' px/s', 4 * K, (VH - 4) * K);
+}
+
+// =====================================================================
+// 操作
+// =====================================================================
+const 押下 = new Set();
+addEventListener('keydown', e => { 押下.add(e.code); if (e.code.startsWith('Arrow') || e.code === 'Space') e.preventDefault(); });
+addEventListener('keyup', e => 押下.delete(e.code));
+addEventListener('blur', () => 押下.clear());
+const 押 = (...k) => k.some(c => 押下.has(c));
+
+function 更新(dt) {
+  const 前 = 押('KeyW', 'ArrowUp'), 後 = 押('KeyS', 'ArrowDown');
+  const 左 = 押('KeyA', 'ArrowLeft'), 右 = 押('KeyD', 'ArrowRight');
+  if (前) 車.v += 140 * dt; else if (後) 車.v -= 110 * dt;
+  else 車.v -= Math.sign(車.v) * Math.min(Math.abs(車.v), 70 * dt);
+  車.v = Math.max(-50, Math.min(110, 車.v));
+  const 効き = Math.min(1, Math.abs(車.v) / 40) * Math.sign(車.v);
+  if (左) 車.a -= 2.6 * dt * 効き;
+  if (右) 車.a += 2.6 * dt * 効き;
+  車.x = Math.max(10, Math.min(世界 - 10, 車.x + Math.sin(車.a) * 車.v * dt));
+  車.y = Math.max(10, Math.min(世界 - 10, 車.y - Math.cos(車.a) * 車.v * dt));
+  camX = 車.x; camY = 車.y;
+  if (設定.follow) {
+    let d = 車.a - cam; d = Math.atan2(Math.sin(d), Math.cos(d));
+    cam += d * Math.min(1, dt * 5);
+  } else {
+    if (押('KeyQ')) cam -= 1.5 * dt;
+    if (押('KeyE')) cam += 1.5 * dt;
+  }
+}
+
+// =====================================================================
+// モデル確認パネル
+// =====================================================================
+const viewer = document.getElementById('viewer'), vctx = viewer.getContext('2d');
+const sel = document.getElementById('modelSel'), sheetimg = document.getElementById('sheetimg');
+for (const k of Object.keys(モデル)) { const op = document.createElement('option'); op.value = op.textContent = k; sel.appendChild(op); }
+function シート表示() {
+  const m = モデル[sel.value];
+  const k = 2; sheetimg.width = m.sheet.width * k; sheetimg.height = m.sheet.height * k;
+  const g = sheetimg.getContext('2d'); g.imageSmoothingEnabled = false;
+  g.drawImage(m.sheet, 0, 0, sheetimg.width, sheetimg.height);
+  g.fillStyle = '#ffffff30';
+  for (let z = 1; z < m.H; z++) g.fillRect(z * m.W * k, 0, 1, sheetimg.height);
+  document.getElementById('info').innerHTML =
+    `${m.W}×${m.D}px のスライス ${m.H} 枚<br>チェックサム <code>${m.checksum}</code>（再読み込みしても同じ値）`;
+}
+sel.onchange = シート表示; シート表示();
+document.getElementById('savePng').onclick = () => {
+  const a = document.createElement('a');
+  a.href = モデル[sel.value].sheet.toDataURL('image/png');
+  a.download = `stack_${sel.value}.png`; a.click();
+};
+let viewerAng = 0;
+function viewer描画(dt) {
+  viewerAng += dt * 0.8;
+  const K = 設定.K;
+  if (viewer.width !== 64 * K) { viewer.width = viewer.height = 64 * K; }
+  vctx.setTransform(1, 0, 0, 1, 0, 0);
+  vctx.clearRect(0, 0, viewer.width, viewer.height);
+  vctx.imageSmoothingEnabled = false;
+  const m = モデル[sel.value];
+  スタック描画(vctx, m, 32 * K, (32 + Math.round(m.H * 設定.spacing / 2)) * K, viewerAng, K);
+}
+
+// =====================================================================
+// 設定UI
+// =====================================================================
+for (const id of ['squash', 'spacing']) {
+  const el = document.getElementById(id), v = document.getElementById(id + 'V');
+  const f = () => { 設定[id] = parseFloat(el.value); v.textContent = el.value; };
+  el.oninput = f; f();
+}
+{
+  const el = document.getElementById('K');
+  el.onchange = () => { 設定.K = parseInt(el.value, 10); el.blur(); };
+}
+for (const id of ['outline', 'shadow', 'follow']) {
+  const el = document.getElementById(id);
+  el.onchange = () => { 設定[id] = el.checked; if (id === 'follow') el.blur(); };
+}
+
+let 前回 = performance.now();
+function loop(t) {
+  const dt = Math.min(0.05, (t - 前回) / 1000); 前回 = t;
+  更新(dt); 描画(); viewer描画(dt);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
